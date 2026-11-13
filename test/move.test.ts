@@ -47,3 +47,21 @@ test("goes for food when hungry", () => {
   const me = snake("me", [[5, 5], [5, 4], [5, 3]], 10);
   assert.equal(chooseMove(game(me, [], [[8, 5]])), "right");
 });
+
+test("duel: moves to claim more territory than the opponent", () => {
+  const me = snake("me", [[2, 5], [1, 5], [0, 5], [0, 4], [0, 3]]);
+  const opponent = snake("other", [[8, 5], [9, 5], [10, 5]]);
+  assert.equal(chooseMove(game(me, [opponent])), "right");
+});
+
+test("duel: goes head-on at a shorter opponent", () => {
+  const me = snake("me", [[5, 5], [5, 4], [5, 3], [5, 2], [5, 1]]);
+  const shorter = snake("other", [[7, 5], [8, 5], [9, 5]]);
+  assert.equal(chooseMove(game(me, [shorter])), "right");
+});
+
+test("duel: keeps eating until 2 longer than the opponent", () => {
+  const me = snake("me", [[5, 5], [5, 4], [5, 3], [5, 2]]);
+  const opponent = snake("other", [[0, 10], [1, 10], [2, 10]]);
+  assert.equal(chooseMove(game(me, [opponent], [[8, 5]])), "right");
+});
