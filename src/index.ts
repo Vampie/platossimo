@@ -8,7 +8,7 @@ export default {
       return Response.json({ apiversion: "1", color: "#22c55e", head: "gamer", tail: "nr-booster", version: "1.0.0" });
     }
     if (request.method === "POST" && pathname === "/move") {
-      return Response.json({ move: chooseMove(await request.json()) });
+      return Response.json({ move: chooseMove(await request.json()), shout: "Bazinga" });
     }
     if (request.method === "POST" && (pathname === "/start" || pathname === "/end")) {
       return new Response("ok");
