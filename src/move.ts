@@ -54,6 +54,47 @@ export function chooseMove({ board, you }: GameState): Move {
     return dist;
   };
 
+  // Ticks from now until the body segment sitting in each cell has moved on (0 = free
+  // already). We know our own future precisely, so every one of our segments gets its
+  // real vacate tick - a stacked tail (just ate) naturally takes the later of its two
+  // ticks by keeping the max. An opponent's path is someone else's choice, so only
+  // their tail (same as the plain blocked-cell model) counts as free; the rest of
+  // their body stays blocked for the whole search, same as before this change.
+  const NEVER = width * height + 1; // past any tick this search can reach
+  const vacateAt = new Uint16Array(width * height);
+  for (const s of board.snakes) {
+    const n = s.body.length;
+    const mine = s.id === you.id;
+    for (let i = 0; i < n; i++) {
+      const k = key(s.body[i].x, s.body[i].y);
+      const ticks = mine || i === n - 1 ? n - i : NEVER;
+      if (ticks > vacateAt[k]) vacateAt[k] = ticks;
+    }
+  }
+
+  // Room from (x, y), but a cell only counts once its vacate tick has passed - so
+  // trailing your own retreating tail around a loop counts as room, while a dead end
+  // that merely ends at your tail's current spot does not, since nothing past it ever
+  // opens up. Stops early once it has already proven enough room.
+  const safeSpace = (x: number, y: number) => {
+    const seen = new Set([key(x, y)]);
+    const queue: [number, number, number][] = [[x, y, 1]]; // this move lands here at tick 1
+    let count = 0;
+    for (let i = 0; i < queue.length; i++) {
+      count++;
+      if (count >= you.length) return count;
+      const [cx, cy, tick] = queue[i];
+      for (const [, dx, dy] of DIRS) {
+        const nx = cx + dx, ny = cy + dy, k = key(nx, ny);
+        if (inBounds(nx, ny) && !seen.has(k) && tick + 1 >= vacateAt[k]) {
+          seen.add(k);
+          queue.push([nx, ny, tick + 1]);
+        }
+      }
+    }
+    return count;
+  };
+
   const longestOther = Math.max(0, ...others.map((s) => s.length));
   // In a duel keep a 2-length lead, so one meal for the opponent does not cost us head-on wins.
   const hungry = you.health < 40 || you.length < longestOther + (duel ? 2 : 1);
@@ -110,7 +151,7 @@ export function chooseMove({ board, you }: GameState): Move {
     options.push({
       move,
       score: [
-        space >= you.length ? 1 : 0,
+        safeSpace(x, y) >= you.length ? 1 : 0,
         risky.has(k) ? 0 : 1,
         duel && prey.has(k) ? 1 : 0,
         hungry ? -foodDist : 0,

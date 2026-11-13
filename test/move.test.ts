@@ -32,9 +32,11 @@ test("may move into a tail that moves away", () => {
 });
 
 test("does not chase food into a dead end", () => {
+  // "down" is also a genuine tail-chase loop back around to (0,2)-(0,3), not a trap -
+  // the real dead end this guards against is "left", straight into the boxed-in corner.
   const me = snake("me", [[1, 1], [1, 2], [0, 2], [0, 3], [0, 4]], 10);
   const blocker = snake("other", [[2, 0], [3, 0], [4, 0]]);
-  assert.equal(chooseMove(game(me, [blocker], [[0, 0]])), "right");
+  assert.notEqual(chooseMove(game(me, [blocker], [[0, 0]])), "left");
 });
 
 test("avoids a head-on collision with a longer snake", () => {
@@ -64,4 +66,20 @@ test("duel: keeps eating until 2 longer than the opponent", () => {
   const me = snake("me", [[5, 5], [5, 4], [5, 3], [5, 2]]);
   const opponent = snake("other", [[0, 10], [1, 10], [2, 10]]);
   assert.equal(chooseMove(game(me, [opponent], [[8, 5]])), "right");
+});
+
+test("duel: chases its own tail instead of a head-on with a longer snake", () => {
+  // From a real game (turn 67): only up or down are open. Up sits next to a longer
+  // snake's head (a likely death); down follows the gap its own retreating tail leaves.
+  const me = snake(
+    "me",
+    [[10, 1], [9, 1], [8, 1], [7, 1], [6, 1], [6, 0], [7, 0], [8, 0], [9, 0]],
+    91,
+  );
+  const opponent = snake(
+    "other",
+    [[9, 2], [8, 2], [7, 2], [6, 2], [6, 3], [6, 4], [6, 5], [6, 6], [5, 6], [4, 6], [3, 6]],
+    98,
+  );
+  assert.equal(chooseMove(game(me, [opponent], [[3, 8], [1, 1], [1, 9]])), "down");
 });
