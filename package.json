@@ -1,0 +1,13 @@
+{
+  "name": "platossimo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "node --test",
+    "game": "battlesnake play -W 11 -H 11 --name Platossimo --url http://localhost:8787 --name Kloon --url http://localhost:8787 --browser"
+  },
+  "devDependencies": {
+    "wrangler": "^4.161.0"
+  }
+}
