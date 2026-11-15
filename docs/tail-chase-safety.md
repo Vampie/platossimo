@@ -357,12 +357,430 @@ vacate-time comparison for your own body's cells (see snork's `food` term), if t
 is ever shown to matter in an A/B test.
 ```
 
+## 7. Opponent-contested space: the single-file-corridor trap
+
+### 7.1 The bug, restated, and a minimal counterexample
+
+As reported this session (two replay frames, turn 61 and turn 64, not independently
+re-verified against the raw replay JSON here — treated as the user's own first-hand
+account of their bot's game): at turn 61 Platossimo (length 9) had a candidate move
+("left") adjacent to a shorter opponent's head, so it got the attack bonus (`prey`),
+*and* its `safeSpace` count came out to exactly 9 — `>= length`, so the existing §6 gate
+scored it "safe." Taking it committed Platossimo to a corridor with branching factor 1
+(exactly one legal move) for two more turns, then zero legal moves on turn 64 — dead,
+three turns after the "safe" move. The reported mechanism: part of that count-of-9 ran
+through a cell that was, at that snapshot, Platossimo's *own* vacating tail (correctly
+counted as "will be free soon" by §6's `vacateAt`) — but the fleeing opponent, retreating
+straight away from the attack, walked its own body into that exact cell (and a
+neighboring one) two-to-three ticks later, before Platossimo's single-file path could
+get there first.
+
+A clean, minimal version of the same mechanism, in the same labeled-cell style as §4's
+counterexample (no board coordinates needed, so there's no grid to get subtly
+inconsistent):
+
+Our snake, length 5, body head-to-tail: `H, b1, b2, b3, T` — same shape as §4. This time
+the dead end beyond `T` isn't a wall; it's one more free cell, `F`, reached through a
+single-file side corridor `C → M → T → F` (branching factor 1 the whole way — no
+alternate cell at any step). Just beyond `F`, the opponent's head `Oh` sits one cell
+away, and the opponent's own body trails off in the *other* direction, so `Oh`'s own
+legal next moves all point back toward `F` over the next couple of ticks rather than
+away from it — exactly the geometry of a snake retreating from the attack-bonus move
+that made this candidate attractive in the first place (§5/`risky`/`prey`).
+
+Candidate move: into `C`. Our tail `T` vacates in 1 tick, same as §4; `safeSpace` walks
+`C → M → T (now vacated) → F`, reaching 4 cells plus whatever else is nearby, comfortably
+`>= length` once a few more cells elsewhere are counted. Nothing is wrong with that part
+— `vacateAt` ages our own tail correctly, and the opponent's current body is correctly
+treated as a permanent wall everywhere except its own tail, per the existing (kept, see
+§7.5) rule. The gap is `F`: it's a *free* cell right now, so neither model blocks it —
+`vacateAt` has nothing to say about a cell no one currently occupies, and the opponent's
+*current* body doesn't reach it either. But the opponent's own near-future path does,
+in about the same number of ticks our single-file walk needs to get there. `safeSpace`
+has no way to know this: it tracks our own tail's vacate schedule and the opponent's
+*current* body as a wall, and has no model at all for what a currently-free cell's
+future occupant might be. If the opponent's retreat reaches `F` at or before our arrival
+tick, our "safe" corridor is blocked from the inside by a wall that didn't exist when we
+computed `safeSpace` — and because the path is single-file, there is nothing to divert
+to. Same dead-end dynamic as §4, except the wall materializes from a second snake's body
+instead of having been there since turn one.
+
+### 7.2 Do snork or battlesnake-rs simulate the opponent's future path? Direct answer
+
+**Not as "predict their one path" — but both do something stronger: flood from every
+living snake's head simultaneously, so the opponent's reachable space is modeled exactly
+as richly as your own, without ever having to guess which way they'll actually go.**
+
+`wrenger/snork`'s `floodfill.rs` `flood_snakes` (lines 230–253) seeds *every* snake,
+not just the acting one, into one shared queue:
+
+```rust
+// Longer or equally long snakes first
+self.flood(
+    grid,
+    snakes
+        .iter()
+        .enumerate()
+        .filter(|&(_, s)| s.alive())
+        .map(|(id, s)| SnakePos::new(s.head(), id as _, 0, 0, s.body.len() as _, s.health)),
+)
+```
+
+and `flood()` (line 137) does `queue.extend(heads)` (line 173) — a genuine multi-source
+BFS, every snake's frontier (yours *and* the enemy's) expanding one tick at a time from
+its own current head, racing for the same cells. `owns()` (line 138) is the per-cell
+arbiter when two frontiers meet:
+
+```rust
+// Reached in same step?
+FCell::Owned { id, health, len, distance } => {
+    distance == s_distance
+        && if id != s_id {
+            // Longer snake wins (on draw we loose)
+            len < s_len || len == s_len && id < s_id
+        } else {
+            // We can reach this with more health
+            health < s_health
+        }
+}
+```
+
+So the "enemy model" isn't a predicted path at all — it's the enemy's *entire*
+reachable frontier, exactly as uncommitted as yours, contesting every cell by arrival
+tick with length/id as the tiebreak. The doc comment on `flood_snakes` (lines 227–229)
+confirms the intent: *"the snake at position and id 0 is the evaluated agent and the
+other snakes are the enemies"* — plural, same algorithm, no special-casing of "their"
+frontier versus "ours" beyond who gets priority in a tie.
+
+`coreyja/battlesnake-rs`'s `spread_from_head_tail_aware.rs` does the identical thing.
+`sorted_snake_ids` (line 87) orders *all* snakes "longer snakes first," then (lines
+113–117) pushes **every** snake's head as a starting frontier:
+
+```rust
+for sid in &sorted_snake_ids {
+    let head = self.get_head_as_native_position(sid);
+    visited[head.as_usize()] = true;
+    todos.push(CellWrapper(head));
+    todos_per_snake[sid.as_usize()] += 1;
+}
+```
+
+and the per-cycle loop (line 132 onward) advances every snake's frontier in the same
+pass, claiming each unclaimed, vacated-in-time cell for whichever snake's turn in the
+(length-sorted) iteration order reaches it first that cycle.
+
+**So: no, neither bot predicts a single most-likely enemy path (that's what this repo's
+own `lookaheadTerritory` does, for a different purpose — see §7.4). Both instead run a
+multi-source, time-respecting flood fill where the opponent's future is modeled by
+letting their frontier expand freely in every direction, the same as yours, and
+resolving collisions by arrival tick.** That is a *better* fit for a safety check than
+path prediction would be: it doesn't require correctly guessing the opponent's
+direction, only bounding what they could geometrically reach by a given tick — exactly
+the conservative property a trap-avoidance gate needs.
+
+A third, independent primary source corroborates the same architecture outside the
+Rust-bot community entirely. [Mejia et al., "Albatross"](https://arxiv.org/abs/2402.03136)
+(Appendix C.1, "Baseline Agent," read via the [ar5iv HTML
+rendering](https://ar5iv.labs.arxiv.org/html/2402.03136) since the arXiv PDF has no
+extractable text layer) describes its Battlesnake baseline's area-control heuristic as a
+flood fill that "fills the board starting from the heads of **all living snakes**"
+(emphasis the mechanism, not a verbatim quote), with — in the stochastic game modes —
+each snake's tail "dynamically deleted... in every iteration" to simulate movement
+(matching §3's vacate-time mechanism independently), and: *"If two snakes are able to
+reach a grid square at the same time, we use the length as a tie break."* Three
+independently-written codebases (one academic, two competitive-community) converge on
+the same shape: seed every snake's head, expand every frontier together, resolve ties by
+length. None of the three use the word "Voronoi" for this (see §7.4).
+
+### 7.3 Where this already exists for a *different* purpose in named competitive bots
+
+Both of the codebases this doc already cites turn out to combine opponent-modeling and
+contested-space scoring in instructive, directly-relevant ways — neither uses the
+contested flood fill as a hard per-move safety *gate* the way `move.ts` uses `safeSpace`.
+
+**`wrenger/snork`.** `src/agents/flood.rs`'s `FloodHeuristic::eval` calls
+`flood_fill.flood_snakes(...)` and turns the *same* multi-source, contested fill from
+§7.2 into a continuous score — `count_health(0)` (own contested space) versus
+`count_health(i)` for "the longest enemy," combined as a ratio (`space_adv`) — fed in as
+one term of a leaf evaluation. That evaluation runs inside `src/agents/maxn.rs`'s
+`iterative_tree_search`, an iterative-deepening MaxN search with `const MAX_DEPTH: usize
+= 16`. In other words: snork doesn't need a boolean "is this corridor a trap" gate at
+all, because it searches up to 16 plies deep and the single-file-corridor trap shows up
+*in the score itself* several plies down (the contested-space ratio collapses, or the
+branch hits `search::LOSS`) — the opponent's own moves are explored as actual tree
+nodes, not predicted. Also found, confirming the user's "Marvin" lead: snork's own
+README names its Tree/MaxN agent *"ich heisse marvin"* ("my name is Marvin"), placing
+1st–2nd in the global, dual, and royale arenas — this is the same snork repo already
+cited in §3, not a separate bot; there is no other public, independently-verified
+"Marvin" Battlesnake codebase found in this search.
+
+**`coreyja/battlesnake-rs`.** The repo contains two bots that split opponent-modeling
+and contested-space-scoring into independently reusable pieces — exactly the split
+`move.ts` currently has (`lookaheadTerritory` vs. `safeSpace`), but wired differently:
+
+- `battlesnake-minimax/src/paranoid/mod.rs` (lines 1–9) implements *Paranoid Minimax*,
+  full opponent-move modeling with **no** flood fill at all: *"This variant assumes all
+  your opponents are working together to minimize your score... When propagating scores
+  up the tree, it chooses the highest score when its your turn and the lowest score when
+  its the opponent's turn."* `devious_devin_eval.rs`'s `score()` function, which plugs
+  into this engine, scores leaves by distance-to-food / distance-to-opponent-head only
+  (`ScoreEndState::ShorterThanOpponent`/`LongerThanOpponent`) — no space/flood-fill term
+  anywhere.
+- `battlesnake-rs/src/hovering_hobbs.rs` reuses that *same* Paranoid Minimax engine but
+  swaps in `standard_score_tail_aware` as the leaf evaluator, which calls
+  `node.squares_per_snake_with_scores_tail_aware(...)` — i.e., it plugs the multi-snake,
+  tail-aware, contested flood fill from §3/§7.2 in as the position score *inside* a full
+  adversarial search, rather than as a per-move boolean gate.
+
+The underlying blog post the `paranoid/mod.rs` doc comment links to,
+[coreyja's "Minimax in Battlesnake"](https://coreyja.com/BattlesnakeMinimax/Minimax%20in%20Battlesnake/),
+names the two multiplayer minimax variants directly: *"Paranoid Minimax gets its name by
+being 'paranoid' and thinking all the opponents are out to get you specifically"* (worst
+case, your single score is minimized by the opponent's actual choice among their real
+moves), versus *MaxN*, where *"Snakes are doing what's best for themselves, not only
+what's bad for you"* (each opponent maximizes its own score, searched as an independent
+branch). Both are genuine multi-ply, alternating game-tree searches over the opponent's
+*actual* legal moves at each node — not a flood fill at all, and architecturally a much
+bigger change than a single extra BFS pass.
+
+[terrarium.coreyja.com](https://terrarium.coreyja.com/)'s bot gallery corroborates the
+naming (*"Hovering Hobbs: Advanced paranoid minimax with flood fill scoring,"* *"Jump
+Flooding: Minimax with jump flooding algorithm for space evaluation... maximizes the
+ratio of squares under its control"*) but is a marketing-style one-line-per-bot gallery
+page, not inspectable source — corroborating only, same caveat as this doc's existing
+CyberSnake/Devpost citation in §3.
+
+**Honest scoping note:** none of this is directly portable to a 10ms-per-move Cloudflare
+Workers budget. Both `MAX_DEPTH = 16` iterative deepening and full Paranoid
+Minimax/MaxN assume a server-side time budget far larger than 10ms (standard Battlesnake
+timeouts are 500ms+). The reason these bots don't need a corridor-trap heuristic gate is
+that they can afford to *search* far enough to see the trap materialize in the score.
+`move.ts` cannot afford that search depth, which is exactly why it needs the §7.5 fix
+below: a cheap, single-pass proxy for "would a few more plies of real search have caught
+this," not a smaller version of minimax itself.
+
+### 7.4 Is there a name for this, and did we reinvent half of it already?
+
+**No single term is used identically across all primary sources found.** The nearest
+thing to a standard name is **"area control"** — used by both the terrarium gallery and
+the Albatross paper (§7.2) for any flood-fill-derived space score. Critically, **none**
+of snork, battlesnake-rs, or the Albatross paper's own baseline call their multi-source,
+tie-broken flood fill "Voronoi," despite it being, mechanically, exactly a time- and
+obstacle-aware Voronoi partition (each cell assigned to whichever snake's expanding
+frontier reaches it first, ties broken by length). Secondary community write-ups (seen
+only via search summaries this session, not fetched as primary sources, so not quoted)
+do use "Voronoi" — but for a *cruder* cousin that compares straight-line/Manhattan
+distance from each head and ignores obstacles entirely, explicitly as an approximation
+to the real flood fill. Since no primary source attests one canonical name for the exact
+mechanism needed here, this doc uses a plain mechanical description instead of coining
+one: a **multi-source, time-respecting flood fill with simultaneous frontiers**
+(equivalently: a *contested* or *shared* flood fill).
+
+**Did `move.ts` already reinvent half of it?** Yes — two different halves, in two
+different places, neither wired to the safety gate:
+
+- `territoryAfter`'s tie-break —
+  `if (mineDist[c] < theirDist[c]) t++; else if (mineDist[c] > theirDist[c]) t--;`
+  (`move.ts` lines 116–119) — is structurally the *same arbitration rule* as snork's
+  `owns()` "reached in same step" branch and battlesnake-rs's length-sorted claim order:
+  whichever BFS reaches a cell first wins it. This is the **multi-source** half.
+- `safeSpace`/`vacateAt` (`move.ts` lines 64–96) is the **time-respecting** half: it
+  correctly ages our own body's cells by vacate tick, the exact mechanism in §3/§6.
+
+But `territoryAfter` is only ever fed a single *static* snapshot (`distances()`, no
+vacate-time awareness for either snake — `blocked2` treats all non-tail body as
+permanently blocked), is only reachable through `lookaheadTerritory`'s one *predicted*
+opponent move (not a free multi-directional frontier), and only feeds `score[4]` (the
+duel tie-break) — never `score[0]` (the safety gate). `safeSpace` is time-respecting but
+strictly single-source (only our own frontier ever expands). **Neither half alone, nor
+the two as currently wired, gives the safety gate what it needs: a BFS that is both
+time-respecting *and* multi-source.** §7.5 combines them for that one purpose,
+reusing both pieces already in the file rather than adding a third parallel mechanism.
+
+### 7.5 Concrete fix
+
+Two independent additions to §6's existing `vacateAt`/`safeSpace`, not a replacement for
+either. Both are scoped to `duel` (one opponent), exactly as `lookaheadTerritory`
+already is, for the same cost reason (§7.6).
+
+**(a) Contested-space discount — the opponent-modeling half, directly reusing the
+pattern from §7.2/§7.3.** Run one extra vacate-respecting BFS per `chooseMove` call,
+seeded at the opponent's *current* head (not a predicted move), using a mirrored vacate
+table (their body ages for real, ours is `NEVER` beyond our own tail — the same rule
+`vacateAt` already applies, with the roles swapped):
+
+```ts
+// Same shape as vacateAt, but from the opponent's point of view: their body gets its
+// real per-segment vacate tick; ours only counts our tail as free, mirroring the rule
+// vacateAt already applies to them. Duel only.
+function vacateAtFor(ownerId: string): Uint16Array {
+  const v = new Uint16Array(width * height);
+  for (const s of board.snakes) {
+    const n = s.body.length;
+    const owner = s.id === ownerId;
+    for (let i = 0; i < n; i++) {
+      const k = key(s.body[i].x, s.body[i].y);
+      const ticks = owner || i === n - 1 ? n - i : NEVER;
+      if (ticks > v[k]) v[k] = ticks;
+    }
+  }
+  return v;
+}
+
+// How soon the opponent could plausibly occupy each cell, moving every tick from their
+// CURRENT head in every direction at once (no path guess — same multi-directional
+// frontier idea as snork's flood_snakes / battlesnake-rs's multi-head seeding, just
+// single-source here because there's only one opponent to bound against). Capped at our
+// own body length: safeSpace never needs to know about anything further out than that.
+function opponentTick(opponent: Snake): Int16Array {
+  const oppVacate = vacateAtFor(opponent.id);
+  const tick = new Int16Array(width * height).fill(-1);
+  const startK = key(opponent.head.x, opponent.head.y);
+  tick[startK] = 0;
+  const queue = [startK];
+  for (let i = 0; i < queue.length; i++) {
+    const k = queue[i], t = tick[k];
+    if (t >= you.length) continue;
+    const cx = k % width, cy = (k / width) | 0;
+    for (const [, dx, dy] of DIRS) {
+      const nx = cx + dx, ny = cy + dy, nk = key(nx, ny);
+      if (inBounds(nx, ny) && tick[nk] === -1 && t + 1 >= oppVacate[nk]) {
+        tick[nk] = t + 1;
+        queue.push(nk);
+      }
+    }
+  }
+  return tick;
+}
+```
+
+A cell only counts toward our own `safeSpace` if we are *strictly* first — a tie is not
+good enough, because the opponent's body still physically occupies or sweeps through
+that cell at the tick we need it, even if a territory-style tie-break would have
+assigned it to us on length:
+
+```ts
+// Inside safeSpace's existing BFS (§6), when testing a neighbor k at tick+1:
+if (inBounds(nx, ny) && !seen.has(k) && tick + 1 >= vacateAt[k]) {
+  if (duel && oppTick[k] !== -1 && oppTick[k] <= tick + 1) continue; // contested: skip it
+  seen.add(k);
+  queue.push([nx, ny, tick + 1]);
+}
+```
+
+**(b) Zero-slack-corridor penalty — independent of the opponent, this doc's own
+reasoned addition.** None of §7.2's or §7.3's sources treat *branching factor* as a
+risk factor separate from raw reachable-cell count — this part is not attributed to any
+of them. The turn-61 counterexample shows a path can satisfy `count >= length` while
+offering no slack at all: once committed, there is exactly one legal next cell for
+several consecutive ticks, so any single wrong assumption anywhere in the model (an
+opponent's move, a food pickup along the way, an off-by-one in the vacate math) is fatal
+with no chance to react. That is a real risk independent of whether the opponent happens
+to contest a specific cell this time, and it is worth scoring for its own sake. Track,
+during the same BFS, whether the swept region ever had a real branch point before the
+bare minimum was met, and if not, require a small safety margin instead of trusting the
+count flat:
+
+```ts
+const CORRIDOR_MARGIN = 2; // shortcut: a flat constant, not tuned - see note below
+
+// safeSpace, extended to return both the count and whether a branch point was seen:
+function safeSpace(x: number, y: number): { count: number; sawBranch: boolean } {
+  const seen = new Set([key(x, y)]);
+  const queue: [number, number, number][] = [[x, y, 1]];
+  let count = 0, sawBranch = false;
+  for (let i = 0; i < queue.length; i++) {
+    const [cx, cy, tick] = queue[i];
+    count++;
+    let branches = 0;
+    for (const [, dx, dy] of DIRS) {
+      const nx = cx + dx, ny = cy + dy, k = key(nx, ny);
+      if (!inBounds(nx, ny) || seen.has(k) || tick + 1 < vacateAt[k]) continue;
+      if (duel && oppTick[k] !== -1 && oppTick[k] <= tick + 1) continue;
+      branches++;
+      seen.add(k);
+      queue.push([nx, ny, tick + 1]);
+    }
+    if (branches >= 2) sawBranch = true;
+    // Stop once either a generous margin is already banked, or a real choice point
+    // has been confirmed and the bare minimum is met - whichever is cheaper to reach.
+    if (count >= you.length + CORRIDOR_MARGIN || (sawBranch && count >= you.length)) {
+      return { count, sawBranch };
+    }
+  }
+  return { count, sawBranch };
+}
+
+// Per candidate move, replacing §6's `safeSpace(x, y) >= you.length`:
+const { count, sawBranch } = safeSpace(x, y);
+const safe = count >= you.length && (sawBranch || count >= you.length + CORRIDOR_MARGIN);
+```
+
+```
+shortcut: CORRIDOR_MARGIN is a flat constant (2), not tuned against real games. Upgrade
+by A/B-testing a couple of values, or by scaling it with `you.length` (a longer snake
+plausibly needs more slack per the same logic), if the flat constant is ever shown to
+misfire either direction.
+```
+
+This is a strict superset of §6, not a parallel system: when there is no opponent
+(`duel` is false) or the swept region has an early branch point and plenty of count, it
+degenerates to exactly today's `count >= you.length`.
+
+### 7.6 Complexity / ~10ms budget
+
+Same conclusion as §6.1, for the same reason: this adds one more same-size BFS, not a
+combinatorial search, because a duel has exactly one opponent to bound against (matching
+the brief precisely — "the opponent's flood fill is one extra same-size BFS, not
+combinatorial").
+
+- `vacateAtFor(opponent.id)`: one extra O(total snake length) pass (well under 100
+  segments on an 11x11 board), once per `chooseMove` call, duel only.
+- `opponentTick`: one extra BFS capped at `you.length` ticks deep, so at most
+  `width * height` = 121 cells visited (fewer in practice, since it stops expanding past
+  our own horizon), once per `chooseMove` call, duel only — not once per candidate
+  direction.
+- Per candidate direction (up to 4 in `chooseMove`'s existing loop): `safeSpace` now
+  scans up to `you.length + CORRIDOR_MARGIN` cells instead of `you.length` (a few more
+  cells, bounded by a small constant), with one extra O(1) array lookup (`oppTick[k]`)
+  and one extra tiny branch-count per cell already being visited — no new pass over the
+  board, just a few more comparisons folded into the loop §6 already runs.
+
+Total added cost per `chooseMove` call in a duel: one extra ≤121-cell BFS plus a few
+hundred extra integer comparisons spread across the up-to-4 existing `safeSpace` calls —
+the same order of magnitude §6.1 already concluded was negligible against a budget that
+already runs a dozen+ BFS passes per move. No new search depth, no backtracking, and
+(by design, per the brief) no per-opponent blowup: a 3+-snake Standard game would need
+this contested check against every opponent to be sound, which is why — like
+`lookaheadTerritory` already does — this stays scoped to `duel` rather than generalizing
+unscoped to Standard play.
+
+### 7.7 Direct answers
+
+**Is there a known name for this technique?** No single term is attested identically
+across the primary sources found. "Area control" is the closest to a standard
+community/academic label for the general family (flood-fill-derived space scoring); the
+specific multi-source, time-respecting, tie-broken-by-length mechanism that snork,
+battlesnake-rs, and the Albatross paper's baseline all independently converge on has no
+single name in any of those three sources — none of them call it "Voronoi," though
+that's the most accurate plain-English description of what it mechanically does.
+
+**Did we essentially reinvent half of it already?** Yes, two different halves, in two
+different places, as detailed in §7.4: `territoryAfter`'s tie-break is the
+**multi-source** half (same arbitration rule as snork's `owns()`); `safeSpace`/`vacateAt`
+is the **time-respecting** half. Neither is currently wired to the safety gate, and
+neither alone is sufficient for it — §7.5 combines them for that specific purpose,
+without replacing either existing use.
+
 ## Sources
 
 - [docs.battlesnake.com/guides/useful-algorithms](https://docs.battlesnake.com/guides/useful-algorithms) — official flood fill / A* guide (static flood fill only, no Voronoi/traps page exists on the official site)
 - [github.com/BattlesnakeOfficial/rules](https://github.com/BattlesnakeOfficial/rules) — rules engine source
   - [`standard.go`](https://github.com/BattlesnakeOfficial/rules/blob/main/standard.go) — `MoveSnakesStandard`, `growSnake`/`FeedSnakesStandard`, `EliminateSnakesStandard`, `snakeIsOutOfBounds`, `snakeIsOutOfHealth`, `snakeHasBodyCollided`, `snakeHasLostHeadToHead`, `standardRulesetStages`
   - [`pipeline.go`](https://github.com/BattlesnakeOfficial/rules/blob/main/pipeline.go) — stage ordering contract (`NewPipelineFromRegistry`)
-- [github.com/wrenger/snork](https://github.com/wrenger/snork) — [`src/floodfill.rs`](https://github.com/wrenger/snork/blob/main/src/floodfill.rs): `FCell::Occupied{id, tail_dist}`, `owns()`, time-aware flood fill
-- [github.com/coreyja/battlesnake-rs](https://github.com/coreyja/battlesnake-rs) — [`battlesnake-rs/src/flood_fill/spread_from_head_tail_aware.rs`](https://github.com/coreyja/battlesnake-rs/blob/main/battlesnake-rs/src/flood_fill/spread_from_head_tail_aware.rs): `body_life`/"enterable cycle", stacked-tail and growth-approximation comments
+- [github.com/wrenger/snork](https://github.com/wrenger/snork) — [`src/floodfill.rs`](https://github.com/wrenger/snork/blob/main/src/floodfill.rs): `FCell::Occupied{id, tail_dist}`, `owns()`, time-aware flood fill; [`src/agents/flood.rs`](https://github.com/wrenger/snork/blob/main/src/agents/flood.rs): `FloodHeuristic` leaf scoring; [`src/agents/maxn.rs`](https://github.com/wrenger/snork/blob/main/src/agents/maxn.rs): iterative-deepening MaxN, `MAX_DEPTH = 16`; README: `Tree`/MaxN agent nicknamed "marvin," Leibniz University Hannover AI games course
+- [github.com/coreyja/battlesnake-rs](https://github.com/coreyja/battlesnake-rs) — [`battlesnake-rs/src/flood_fill/spread_from_head_tail_aware.rs`](https://github.com/coreyja/battlesnake-rs/blob/main/battlesnake-rs/src/flood_fill/spread_from_head_tail_aware.rs): `body_life`/"enterable cycle", stacked-tail and growth-approximation comments, multi-head seeding; [`battlesnake-minimax/src/paranoid/mod.rs`](https://github.com/coreyja/battlesnake-rs/blob/main/battlesnake-minimax/src/paranoid/mod.rs): Paranoid Minimax; [`battlesnake-rs/src/devious_devin_eval.rs`](https://github.com/coreyja/battlesnake-rs/blob/main/battlesnake-rs/src/devious_devin_eval.rs): minimax without flood fill; [`battlesnake-rs/src/hovering_hobbs.rs`](https://github.com/coreyja/battlesnake-rs/blob/main/battlesnake-rs/src/hovering_hobbs.rs): tail-aware flood fill as a Paranoid Minimax leaf eval
+- [coreyja.com/BattlesnakeMinimax/Minimax in Battlesnake](https://coreyja.com/BattlesnakeMinimax/Minimax%20in%20Battlesnake/) — Paranoid Minimax vs. MaxN explained by the `battlesnake-minimax` crate's own author
+- [terrarium.coreyja.com](https://terrarium.coreyja.com/) — bot gallery corroborating Paranoid Minimax/MaxN/Jump-Flooding naming (marketing-style page, not inspectable source, corroborating only)
+- [arxiv.org/abs/2402.03136](https://arxiv.org/abs/2402.03136) (Mejia et al., "Albatross"), Appendix C.1 "Baseline Agent," read via the [ar5iv HTML rendering](https://ar5iv.labs.arxiv.org/html/2402.03136) — independent academic confirmation of multi-source, tail-removing flood fill with length tie-break, for the Battlesnake baseline agent specifically
 - [devpost.com/software/cybersnake](https://devpost.com/software/cybersnake) — author's own description of a "time-aware flood fill" treating the tail as temporarily passable (corroborating, seen via search snippet only — direct fetch returned HTTP 403, so not quoted as a code source)

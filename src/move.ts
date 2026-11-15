@@ -61,38 +61,83 @@ export function chooseMove({ board, you }: GameState): Move {
   // their tail (same as the plain blocked-cell model) counts as free; the rest of
   // their body stays blocked for the whole search, same as before this change.
   const NEVER = width * height + 1; // past any tick this search can reach
-  const vacateAt = new Uint16Array(width * height);
-  for (const s of board.snakes) {
-    const n = s.body.length;
-    const mine = s.id === you.id;
-    for (let i = 0; i < n; i++) {
-      const k = key(s.body[i].x, s.body[i].y);
-      const ticks = mine || i === n - 1 ? n - i : NEVER;
-      if (ticks > vacateAt[k]) vacateAt[k] = ticks;
+  // Same vacate-tick rule as before, but usable for either side: ownerId's own body
+  // ages for real, everyone else only ever frees up their own tail.
+  const vacateAtFor = (ownerId: string) => {
+    const v = new Uint16Array(width * height);
+    for (const s of board.snakes) {
+      const n = s.body.length;
+      const owner = s.id === ownerId;
+      for (let i = 0; i < n; i++) {
+        const k = key(s.body[i].x, s.body[i].y);
+        const ticks = owner || i === n - 1 ? n - i : NEVER;
+        if (ticks > v[k]) v[k] = ticks;
+      }
     }
-  }
+    return v;
+  };
+  const vacateAt = vacateAtFor(you.id);
+
+  // How soon the opponent could plausibly occupy each cell, expanding every tick from
+  // their current head in every direction - not a guessed path, just a bound on what
+  // they could reach by a given tick. Capped at our own length: safeSpace never needs
+  // to know about anything further out than that. Duel only (one opponent to bound).
+  const opponentTick = (opponent: Snake) => {
+    const oppVacate = vacateAtFor(opponent.id);
+    const tick = new Int16Array(width * height).fill(-1);
+    const startK = key(opponent.head.x, opponent.head.y);
+    tick[startK] = 0;
+    const queue = [startK];
+    for (let i = 0; i < queue.length; i++) {
+      const k = queue[i], t = tick[k];
+      if (t >= you.length) continue;
+      const cx = k % width, cy = (k / width) | 0;
+      for (const [, dx, dy] of DIRS) {
+        const nx = cx + dx, ny = cy + dy, nk = key(nx, ny);
+        if (inBounds(nx, ny) && tick[nk] === -1 && t + 1 >= oppVacate[nk]) {
+          tick[nk] = t + 1;
+          queue.push(nk);
+        }
+      }
+    }
+    return tick;
+  };
+  const oppTick = duel ? opponentTick(others[0]) : null;
+
+  const CORRIDOR_MARGIN = 2; // shortcut: a flat constant, not tuned - widen if a thin corridor still gets through
 
   // Room from (x, y), but a cell only counts once its vacate tick has passed - so
   // trailing your own retreating tail around a loop counts as room, while a dead end
   // that merely ends at your tail's current spot does not, since nothing past it ever
-  // opens up. Stops early once it has already proven enough room.
+  // opens up. A cell the opponent could reach at or before our own arrival tick doesn't
+  // count either - their body may still be sweeping through it when we'd need it. And a
+  // single-file path with no branch point needs a margin above the bare minimum, since
+  // one wrong assumption anywhere along it leaves no room to react.
   const safeSpace = (x: number, y: number) => {
     const seen = new Set([key(x, y)]);
     const queue: [number, number, number][] = [[x, y, 1]]; // this move lands here at tick 1
-    let count = 0;
+    let count = 0, sawBranch = false;
     for (let i = 0; i < queue.length; i++) {
-      count++;
-      if (count >= you.length) return count;
       const [cx, cy, tick] = queue[i];
+      count++;
+      let branches = 0;
       for (const [, dx, dy] of DIRS) {
         const nx = cx + dx, ny = cy + dy, k = key(nx, ny);
-        if (inBounds(nx, ny) && !seen.has(k) && tick + 1 >= vacateAt[k]) {
-          seen.add(k);
-          queue.push([nx, ny, tick + 1]);
+        if (!inBounds(nx, ny) || seen.has(k) || tick + 1 < vacateAt[k]) continue;
+        // Contested: the opponent could be there first, or at the same tick without us
+        // being strictly longer - a tie only goes to us if we'd win the head-on.
+        if (duel && oppTick && oppTick[k] !== -1) {
+          const theirs = oppTick[k], arrive = tick + 1;
+          if (theirs < arrive || (theirs === arrive && others[0].length >= you.length)) continue;
         }
+        branches++;
+        seen.add(k);
+        queue.push([nx, ny, tick + 1]);
       }
+      if (branches >= 2) sawBranch = true;
+      if (count >= you.length + CORRIDOR_MARGIN || (sawBranch && count >= you.length)) break;
     }
-    return count;
+    return count >= you.length && (sawBranch || count >= you.length + CORRIDOR_MARGIN);
   };
 
   const longestOther = Math.max(0, ...others.map((s) => s.length));
@@ -151,7 +196,7 @@ export function chooseMove({ board, you }: GameState): Move {
     options.push({
       move,
       score: [
-        safeSpace(x, y) >= you.length ? 1 : 0,
+        safeSpace(x, y) ? 1 : 0,
         risky.has(k) ? 0 : 1,
         duel && prey.has(k) ? 1 : 0,
         hungry ? -foodDist : 0,

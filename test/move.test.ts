@@ -83,3 +83,20 @@ test("duel: chases its own tail instead of a head-on with a longer snake", () =>
   );
   assert.equal(chooseMove(game(me, [opponent], [[3, 8], [1, 1], [1, 9]])), "down");
 });
+
+test("duel: avoids an attack that commits to a corridor the opponent can retreat into", () => {
+  // From a real game (turn 61): "left" attacks a shorter opponent and its static room
+  // count looked fine (9, exactly our length), but the opponent's own retreat path runs
+  // straight through that corridor and seals it 2-3 ticks later - dead end 3 turns on.
+  const me = snake(
+    "me",
+    [[4, 7], [4, 8], [4, 9], [3, 9], [2, 9], [2, 10], [1, 10], [1, 9], [1, 8]],
+    94,
+  );
+  const opponent = snake(
+    "other",
+    [[2, 7], [2, 6], [3, 6], [3, 5], [3, 4], [4, 4], [5, 4], [5, 3]],
+    83,
+  );
+  assert.notEqual(chooseMove(game(me, [opponent], [[3, 3]])), "left");
+});
